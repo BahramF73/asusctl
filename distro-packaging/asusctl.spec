@@ -34,8 +34,8 @@ License: MPLv2
 
 Group:   System Environment/Kernel
 
-URL:     https://gitlab.com/asus-linux/asusctl
-Source:  https://gitlab.com/asus-linux/asusctl/-/archive/%{version}/%{name}-%{version}.tar.gz
+URL:     https://github.com/OpenGamingCollective/asusctl
+Source:  https://github.com/OpenGamingCollective/asusctl/archive/refs/tags/%{version}.tar.gz
 
 %if %{defined fedora}
 BuildRequires:  rust-packaging
