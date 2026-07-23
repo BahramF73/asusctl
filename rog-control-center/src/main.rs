@@ -13,13 +13,15 @@ use rog_control_center::cli_options::CliStart;
 use rog_control_center::config::Config;
 use rog_control_center::error::Result;
 use rog_control_center::notify::start_notifications;
+use rog_control_center::print_versions;
+use rog_control_center::shortcuts::EnableMode;
 use rog_control_center::slint::ComponentHandle;
 use rog_control_center::tray::init_tray;
 use rog_control_center::ui::setup_window;
+use rog_control_center::window::{WindowCommand, WindowController};
 use rog_control_center::zbus_proxies::{
     AppState, ROGCCZbus, ROGCCZbusProxyBlocking, ZBUS_IFACE, ZBUS_PATH,
 };
-use rog_control_center::{print_versions, MainWindow};
 use tokio::runtime::Runtime;
 
 #[tokio::main]
@@ -93,7 +95,7 @@ async fn main() -> Result<()> {
 
     let state_zbus = ROGCCZbus::new();
     let app_state = state_zbus.clone_state();
-    let _conn = zbus::connection::Builder::session()?
+    let conn = zbus::connection::Builder::session()?
         .name(ZBUS_IFACE)?
         .serve_at(ZBUS_PATH, state_zbus)?
         .build()
@@ -162,6 +164,7 @@ async fn main() -> Result<()> {
         config.startup_in_background = false;
         config.start_fullscreen = true;
         config.enable_autostart = false;
+        config.enable_global_shortcut = false;
     }
 
     config.write();
@@ -175,13 +178,6 @@ async fn main() -> Result<()> {
     let config = Arc::new(Mutex::new(config));
 
     start_notifications(config.clone(), &rt)?;
-
-    if enable_tray_icon {
-        init_tray(supported_properties, config.clone());
-    }
-
-    thread_local! { pub static UI: std::cell::RefCell<Option<MainWindow>> = Default::default()};
-    // i_slint_backend_selector::with_platform(|_| Ok(())).unwrap();
 
     if !startup_in_background {
         if let Ok(mut app_state) = app_state.lock() {
@@ -204,12 +200,41 @@ async fn main() -> Result<()> {
         rog_control_center::ui::setup_aura::prefetch_supported_basic_modes().await,
     );
 
+    let window = WindowController::new(
+        config.clone(),
+        prefetched_supported.clone(),
+        app_state.clone(),
+        is_tuf,
+    );
+
+    let shortcut_service = if is_rog_ally {
+        None
+    } else {
+        let service =
+            rog_control_center::shortcuts::start(rt.handle(), conn.clone(), window.clone());
+        let handle = service.handle();
+        window.set_shortcuts(handle.clone());
+        if config.lock().is_ok_and(|c| c.enable_global_shortcut) {
+            let restore = handle.clone();
+            rt.spawn(async move {
+                restore.enable(EnableMode::Restore).await;
+            });
+        }
+        Some(service)
+    };
+
+    if enable_tray_icon {
+        init_tray(supported_properties, config.clone(), window.clone());
+    }
+
+    let shortcuts = shortcut_service.as_ref().map(|service| service.handle());
     thread::spawn(move || {
         let mut state = AppState::StartingUp;
         loop {
             if is_rog_ally {
                 let config_copy_2 = config.clone();
-                let newui = setup_window(config.clone(), prefetched_supported.clone(), is_tuf);
+                let newui =
+                    setup_window(config.clone(), prefetched_supported.clone(), is_tuf, None);
                 newui.window().on_close_requested(move || {
                     exit(0);
                 });
@@ -244,68 +269,18 @@ async fn main() -> Result<()> {
             // This sleep is required to give the event loop time to react
             sleep(Duration::from_millis(300));
             if state == AppState::MainWindowShouldOpen {
-                if let Ok(mut app_state) = app_state.lock() {
-                    *app_state = AppState::MainWindowOpen;
-                }
-
-                let config_copy = config.clone();
-                let app_state_copy = app_state.clone();
-                // Avoid moving the original `prefetched_supported` into the
-                // closure — clone an Arc for the closure to capture.
-                let pref_for_invoke = prefetched_supported.clone();
-                slint::invoke_from_event_loop(move || {
-                    UI.with(|ui| {
-                        let app_state_copy = app_state_copy.clone();
-                        let mut ui = ui.borrow_mut();
-                        if let Some(ui) = ui.as_mut() {
-                            ui.window().show().unwrap();
-                            ui.window().on_close_requested(move || {
-                                if let Ok(mut app_state) = app_state_copy.lock() {
-                                    *app_state = AppState::MainWindowClosed;
-                                }
-                                slint::CloseRequestResponse::HideWindow
-                            });
-                        } else {
-                            let config_copy_2 = config_copy.clone();
-                            let newui = setup_window(config_copy, pref_for_invoke.clone(), is_tuf);
-                            newui.window().on_close_requested(move || {
-                                if let Ok(mut app_state) = app_state_copy.lock() {
-                                    *app_state = AppState::MainWindowClosed;
-                                }
-                                slint::CloseRequestResponse::HideWindow
-                            });
-
-                            let ui_copy = newui.as_weak();
-                            newui
-                                .window()
-                                .set_rendering_notifier(move |s, _| {
-                                    if let slint::RenderingState::RenderingSetup = s {
-                                        let config = config_copy_2.clone();
-                                        ui_copy
-                                            .upgrade_in_event_loop(move |w| {
-                                                let fullscreen =
-                                                    config.lock().is_ok_and(|c| c.start_fullscreen);
-                                                if fullscreen && !w.window().is_fullscreen() {
-                                                    w.window().set_fullscreen(fullscreen);
-                                                }
-                                            })
-                                            .ok();
-                                    }
-                                })
-                                .ok();
-                            ui.replace(newui);
-                        }
-                    });
-                })
-                .unwrap();
+                window.request(WindowCommand::Show);
             } else if state == AppState::QuitApp {
-                slint::quit_event_loop().unwrap();
-                exit(0);
+                window.request(WindowCommand::Quit);
+                break;
             } else if state != AppState::MainWindowOpen {
                 if let Ok(config) = config.lock() {
-                    if !config.run_in_background {
-                        slint::quit_event_loop().unwrap();
-                        exit(0);
+                    let shortcut_alive = shortcuts
+                        .as_ref()
+                        .is_some_and(|s| s.status().keeps_alive(config.enable_global_shortcut));
+                    if !config.run_in_background && !shortcut_alive {
+                        window.request(WindowCommand::Quit);
+                        break;
                     }
                 }
             }
@@ -313,6 +288,13 @@ async fn main() -> Result<()> {
     });
 
     slint::run_event_loop_until_quit().unwrap();
+    // Restore the outer Tokio context before awaiting a task owned by the
+    // application runtime, then stop that runtime only after the portal
+    // session has been closed.
+    drop(_enter);
+    if let Some(service) = shortcut_service {
+        service.shutdown().await;
+    }
     rt.shutdown_background();
     Ok(())
 }

@@ -12,12 +12,15 @@ pub mod error;
 #[cfg(feature = "mocking")]
 pub mod mocking;
 pub mod notify;
+pub mod shortcuts;
 pub mod tray;
 pub mod types;
 pub mod ui;
+pub mod window;
 pub mod zbus_proxies;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const APP_ID: &str = "org.opengamingcollective.rog-control-center";
 pub const APP_ICON_PATH: &str = "/usr/share/icons/hicolor/512x512/apps/rog-control-center.png";
 
 pub fn print_versions() {

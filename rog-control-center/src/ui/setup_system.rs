@@ -37,6 +37,13 @@ pub fn setup_system_page(ui: &MainWindow, _config: Arc<Mutex<Config>>) {
         .set_charge_control_end_threshold(-1.0);
     ui.global::<SystemPageData>()
         .set_charge_control_enabled(false);
+    ui.global::<SystemPageData>().set_battery_health(-1);
+    ui.global::<SystemPageData>()
+        .set_battery_power_consumption(-1.0);
+    ui.global::<SystemPageData>()
+        .set_battery_status("Unknown".into());
+    ui.global::<SystemPageData>()
+        .set_battery_time_estimate("".into());
     ui.global::<SystemPageData>().set_platform_profile(-1);
     ui.global::<SystemPageData>().set_panel_overdrive(-1);
     ui.global::<SystemPageData>().set_boot_sound(-1);
@@ -57,11 +64,30 @@ pub fn setup_system_page(ui: &MainWindow, _config: Arc<Mutex<Config>>) {
     ui.global::<SystemPageData>()
         .set_ppt_enabled_available(false);
 
+    let has_dgpu = {
+        let devices = rog_platform::gpu_pci::Device::find().unwrap_or_default();
+        devices.iter().any(|d| d.is_dgpu())
+            || rog_platform::gpu_pci::asus_dgpu_disable_exists()
+            || rog_platform::gpu_pci::asus_gpu_mux_exists()
+    };
+    ui.global::<SystemPageData>().set_has_dgpu(has_dgpu);
+
+    let cpu_model = rog_platform::cpu::get_cpu_model();
+    let (igpu_model, dgpu_model) = rog_platform::gpu_pci::get_gpu_names();
+    let has_igpu = igpu_model != "Integrated GPU" && !igpu_model.is_empty();
+
+    ui.global::<SystemPageData>().set_cpu_name(cpu_model.into());
+    ui.global::<SystemPageData>()
+        .set_igpu_name(igpu_model.into());
+    ui.global::<SystemPageData>()
+        .set_dgpu_name(dgpu_model.into());
+    ui.global::<SystemPageData>().set_has_igpu(has_igpu);
+
     if let Ok(sys_props) = platform
         .supported_properties()
         .map_err(|e| log::error!("Failed to get supported properties: {}", e))
     {
-        log::debug!("Available system properties: {:?}", &sys_props);
+        log::debug!("Available system properties: {:?}", sys_props);
         if sys_props.contains(&Properties::ChargeControlEndThreshold) {
             ui.global::<SystemPageData>()
                 .set_charge_control_end_threshold(60.0);
@@ -69,6 +95,90 @@ pub fn setup_system_page(ui: &MainWindow, _config: Arc<Mutex<Config>>) {
                 .set_charge_control_enabled(true);
         }
     }
+
+    let handle = ui.as_weak();
+    tokio::spawn(async move {
+        let mut prev_ticks = rog_platform::cpu::read_cpu_ticks();
+        loop {
+            let power = rog_platform::power::AsusPower::new().ok();
+            let (has_bat, health, consumption, status, estimate_str) = if let Some(ref p) = power {
+                if p.has_battery() {
+                    let health = p.get_battery_health().unwrap_or(0) as i32;
+                    let consumption = p.get_battery_power_consumption().unwrap_or(-1.0);
+                    let status = p
+                        .get_battery_status()
+                        .unwrap_or_else(|_| "Unknown".to_string());
+                    let estimate = p.get_battery_time_estimate().ok().flatten();
+                    let est_str = if let Some((_, h, m)) = estimate {
+                        if h > 0 {
+                            format!("{}h {}m", h, m)
+                        } else {
+                            format!("{}m", m)
+                        }
+                    } else {
+                        "".to_string()
+                    };
+                    (true, health, consumption, status, est_str)
+                } else {
+                    (false, -1, -1.0, "Unknown".to_string(), "".to_string())
+                }
+            } else {
+                (false, -1, -1.0, "Unknown".to_string(), "".to_string())
+            };
+
+            let cpu_temp = rog_platform::cpu::get_cpu_temp();
+            let gpu_temp = rog_platform::gpu_pci::get_gpu_temp();
+            let igpu_temp = rog_platform::gpu_pci::get_igpu_temp();
+            let (cpu_fan, gpu_fan, mid_fan) = rog_platform::platform::get_fan_rpms();
+            let cpu_freq = rog_platform::cpu::get_cpu_frequency_mhz();
+            let ram_usage = rog_platform::cpu::get_ram_usage_pct();
+            let gpu_usage = rog_platform::gpu_pci::get_gpu_usage_pct();
+            let igpu_usage = rog_platform::gpu_pci::get_igpu_usage_pct();
+
+            let curr_ticks = rog_platform::cpu::read_cpu_ticks();
+            let cpu_usage = if let (Some(p), Some(c)) = (&prev_ticks, &curr_ticks) {
+                let idle_diff = c.idle.saturating_sub(p.idle) as f32;
+                let total_diff = c.total.saturating_sub(p.total) as f32;
+                if total_diff > 0.0 {
+                    ((1.0 - (idle_diff / total_diff)) * 100.0).clamp(0.0, 100.0)
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+            prev_ticks = curr_ticks;
+
+            let success = handle.upgrade_in_event_loop(move |ui| {
+                let data = ui.global::<SystemPageData>();
+                if has_bat {
+                    data.set_battery_health(health);
+                    data.set_battery_power_consumption(consumption);
+                    data.set_battery_status(status.into());
+                    data.set_battery_time_estimate(estimate_str.into());
+                } else {
+                    data.set_battery_health(-1);
+                }
+                data.set_cpu_temp_val(cpu_temp);
+                data.set_gpu_temp_val(gpu_temp);
+                data.set_igpu_temp_val(igpu_temp);
+                data.set_cpu_usage_val(cpu_usage);
+                data.set_gpu_usage_val(gpu_usage);
+                data.set_igpu_usage_val(igpu_usage);
+                data.set_ram_usage_val(ram_usage);
+                data.set_cpu_freq_mhz(cpu_freq);
+                data.set_cpu_fan_rpm(cpu_fan);
+                data.set_gpu_fan_rpm(gpu_fan);
+                data.set_mid_fan_rpm(mid_fan);
+            });
+
+            if success.is_err() {
+                break;
+            }
+
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+    });
 }
 
 macro_rules! convert_value {
